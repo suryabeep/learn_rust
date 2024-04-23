@@ -1,4 +1,15 @@
 use array2d::{Array2D};
+use clap::Parser;
+use std::fs::File;
+use std::io::{BufReader, BufRead};
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Input file containing the game's start state
+    #[arg(short, long)]
+    file: String,
+}
 
 #[derive(Clone, PartialEq, Copy)]
 enum CellState {
@@ -58,13 +69,35 @@ fn construct_game(dim: &usize) -> GameState {
     return game;
 }
 
+fn setup_states_from_file(filename: String) -> (GameState, GameState) {
+
+    let file = match File::open(filename) {
+        Ok(obj) => obj,
+        Err(e) => panic!("Could not open the file: {:?}", e),
+    };
+
+    let mut lines = BufReader::new(file).lines();
+
+    let mut grid_dim = 8;
+    match lines.next() {
+        Some(Ok(val)) => { grid_dim = val.parse::<usize>().expect("Not a valid number"); },
+        Some(Err(e)) => panic!("There was a problem with a line: {:?}", e),
+        None => panic!("File did not contain any lines!"),
+    };
+
+    println!("Grid dim was parsed as: {}", &grid_dim);
+
+    let state_a = construct_game(&grid_dim);
+    let state_b = construct_game(&grid_dim);
+    return (state_a, state_b);
+}
+
 fn main() {
     println!("Welcome to the Game of Life!");
 
-    let grid_dim : usize = 8;
+    let args = Args::parse();
 
-    let mut state_a = construct_game(&grid_dim);
-    let mut state_b = construct_game(&grid_dim);
+    let (mut state_a, mut state_b) = setup_states_from_file(args.file);
 
     let iterations = 5;
     for i in 0..iterations {
