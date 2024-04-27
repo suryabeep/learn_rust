@@ -2,6 +2,9 @@ use array2d::{Array2D};
 use clap::Parser;
 use std::fs::File;
 use std::io::{BufReader, BufRead};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use num_cpus;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -26,6 +29,42 @@ struct GameState {
     state: Array2D<CellState>,
 }
 
+fn update_single_cell(mut_self: &Mutex<&mut GameState>, prev_state: &GameState, row_idx: usize, col_idx: usize) {
+    // Determine the bounds of the subarray to consider
+    let top_left_row_idx = if row_idx == 0 { 0 } else { row_idx - 1};
+    let top_left_col_idx = if col_idx == 0 { 0 } else { col_idx - 1};
+    let bottom_right_row_idx = if row_idx + 1 > prev_state.state.num_rows() { row_idx } else { row_idx + 1};
+    let bottom_right_col_idx = if col_idx + 1 > prev_state.state.num_columns() { col_idx } else { col_idx + 1};
+    let num_rows = bottom_right_row_idx - top_left_row_idx + 1;
+    let num_cols = bottom_right_col_idx - top_left_col_idx + 1;
+    
+    // Get the subarray.
+    let subarray = prev_state.state.rows_iter()
+        .skip(top_left_row_idx)
+        .take(num_rows)
+        .map(|row| row.skip(top_left_col_idx).take(num_cols).collect::<Vec<_>>())
+        .flatten()
+        .collect::<Vec<_>>();
+
+    // Compute the number of live cells
+    let num_live_cells = subarray.iter().map(|x| if **x == CellState::Live {1} else {0}).fold(0, |acc, x| acc + x);
+    
+    // The subarray includes the current cell, so we may need to exclude from the live count.
+    let mut locked_self = mut_self.lock().unwrap();
+    let num_live_neighbours = match locked_self.state[(row_idx, col_idx)] {
+        CellState::Live => num_live_cells - 1,
+        CellState::Dead => num_live_cells,
+    };
+
+    // apply the game rules to this cell
+    locked_self.state[(row_idx, col_idx)] = match num_live_neighbours {
+        0 | 1 => CellState::Dead,
+        2     => locked_self.state[(row_idx, col_idx)], // Live cells stay alive, dead cells stay dead
+        3     => CellState::Live,   // live cells survive, and dead cells revive
+        _     => CellState::Dead,
+    };
+}
+
 impl GameState {
     fn clone(&self) -> Self {
         GameState {
@@ -35,46 +74,28 @@ impl GameState {
 
     fn update(&mut self, prev_state: &GameState) {
         assert_eq!(self.state.num_rows(), prev_state.state.num_rows());
-        for i in 0..self.state.num_rows() {
-            for j in 0..self.state.num_columns() {
-                self.update_single_cell(prev_state, i, j);
+        
+        let num_threads = num_cpus::get();
+        let rows_per_thread = (self.state.num_rows() as f64 / num_threads as f64).ceil() as usize;
+        let num_rows = self.state.num_rows();
+        let num_columns = self.state.num_columns();
+
+        let arc_self = Arc::new(Mutex::new(self));
+
+        thread::scope(|s| {
+            for thread_index in 0..num_threads {
+                let start_row = thread_index * rows_per_thread;
+                let end_row = (thread_index + 1) * rows_per_thread;
+                let thread_self = Arc::clone(&arc_self);
+                s.spawn(move || {
+                    for i in start_row..end_row.min(num_rows) {
+                        for j in 0..num_columns {
+                            update_single_cell(&thread_self, &prev_state, i, j);
+                        }
+                    }
+                });
             }
-        }
-    }
-
-    fn update_single_cell(&mut self, prev_state: &GameState, row_idx: usize, col_idx: usize) {
-        // Determine the bounds of the subarray to consider
-        let top_left_row_idx = if row_idx == 0 { 0 } else { row_idx - 1};
-        let top_left_col_idx = if col_idx == 0 { 0 } else { col_idx - 1};
-        let bottom_right_row_idx = if row_idx + 1 > prev_state.state.num_rows() { row_idx } else { row_idx + 1};
-        let bottom_right_col_idx = if col_idx + 1 > prev_state.state.num_columns() { col_idx } else { col_idx + 1};
-        let num_rows = bottom_right_row_idx - top_left_row_idx + 1;
-        let num_cols = bottom_right_col_idx - top_left_col_idx + 1;
-        
-        // Get the subarray.
-        let subarray = prev_state.state.rows_iter()
-            .skip(top_left_row_idx)
-            .take(num_rows)
-            .map(|row| row.skip(top_left_col_idx).take(num_cols).collect::<Vec<_>>())
-            .flatten()
-            .collect::<Vec<_>>();
-
-        // Compute the number of live cells
-        let num_live_cells = subarray.iter().map(|x| if **x == CellState::Live {1} else {0}).fold(0, |acc, x| acc + x);
-        
-        // The subarray includes the current cell, so we may need to exclude from the live count.
-        let num_live_neighbours = match self.state[(row_idx, col_idx)] {
-            CellState::Live => num_live_cells - 1,
-            CellState::Dead => num_live_cells,
-        };
-
-        // apply the game rules to this cell
-        self.state[(row_idx, col_idx)] = match num_live_neighbours {
-            0 | 1 => CellState::Dead,
-            2     => self.state[(row_idx, col_idx)], // Live cells stay alive, dead cells stay dead
-            3     => CellState::Live,   // live cells survive, and dead cells revive
-            _     => CellState::Dead,
-        };
+        });
     }
 
     fn print(&self) {
@@ -157,14 +178,19 @@ fn main() {
 
     let iterations = args.iterations;
     for i in 0..iterations {
-        println!("\nIteration #{}:", i + 1);
         if i % 2 == 0 {
             state_b.update(&state_a);
-            state_b.print();
         }
         else {
             state_a.update(&state_b);
-            state_a.print();
         }
+    }
+
+    println!("Final state after {} iterations was:", iterations);
+    if iterations % 2 == 0 {
+        state_a.print();
+    }
+    else {
+        state_b.print();
     }
 }
